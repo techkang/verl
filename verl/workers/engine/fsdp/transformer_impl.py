@@ -85,6 +85,34 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def safe_clip_grad_norm_fsdp(model, max_norm, norm_type=2.0):
+    """FSDP安全的梯度裁剪"""
+    if isinstance(model, FSDP):
+        # For single-process setups FULL_SHARD still reports sharded handles, which
+        # routes through the distributed clipping logic in PyTorch. That path
+        # can trigger CUDA illegal memory access when a flattened parameter did
+        # not participate in the backward pass (grad stays None, e.g. the VLM
+        # projector on text-only batches). Fall back to the regular per-rank
+        # implementation in that case.
+        if torch.distributed.get_world_size() == 1:
+            parameters = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
+            if not parameters:
+                device = next(model.parameters()).device
+                return torch.tensor(0.0, device=device)
+            return torch.nn.utils.clip_grad_norm_(
+                parameters, max_norm, norm_type, foreach=False, error_if_nonfinite=False
+            )
+
+        # 使用FSDP的内置方法
+        return model.clip_grad_norm_(max_norm, norm_type)
+    else:
+        # 普通模型的梯度裁剪
+        parameters = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
+        if len(parameters) == 0:
+            return torch.tensor(0.0)
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type)
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -512,12 +540,11 @@ class FSDPEngine(BaseEngine):
             grad_norm (float): Norm of gradients before clipping.
         """
         assert self.optimizer_config.clip_grad is not None
-        import ipdb
 
-        ipdb.set_trace()
+        # Check for None, NaN, and Inf gradients and print parameter names
 
         if isinstance(self.module, FSDP):
-            grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
+            grad_norm = safe_clip_grad_norm_fsdp(self.module, max_norm=self.optimizer_config.clip_grad)
         elif isinstance(self.module, FSDPModule):
             grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=self.optimizer_config.clip_grad)
         else:
