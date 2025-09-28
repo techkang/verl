@@ -32,7 +32,7 @@ CP_SIZE=${CP_SIZE:-1}
 FSDP_ENGINE_CONFIG="\
     engine=${backend} \
     optim=${backend} \
-    optim.lr=1e-5 \
+    optim.lr=1e-4 \
     optim.lr_warmup_steps_ratio=0.2 \
     optim.weight_decay=0.1 \
     optim.betas="[0.9,0.95]" \
@@ -75,7 +75,7 @@ mkdir -p "${ckpts_home}"
 torchrun --standalone --nnodes=1 --nproc_per_node=${NUM_GPUS} ${ENTRYPOINT} \
     data.train_files="${TRAIN_FILES}" \
     data.val_files="${VAL_FILES}" \
-    data.train_batch_size=16 \
+    data.train_batch_size=32 \
     data.max_length=8192 \
     data.pad_mode=left_right \
     data.truncation=error \
@@ -86,13 +86,13 @@ torchrun --standalone --nnodes=1 --nproc_per_node=${NUM_GPUS} ${ENTRYPOINT} \
     model.path=$MODEL_PATH \
     ${ENGINE_CONFIG} \
     model.trust_remote_code=True \
-    trainer.test_freq=20 \
-    trainer.save_freq=200 \
+    trainer.test_freq=200000 \
+    trainer.save_freq=2000 \
     trainer.logger=['console','file'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.total_epochs=1 \
-    trainer.total_training_steps=1000 \
+    trainer.total_epochs=3 \
+    trainer.total_training_steps=10000 \
     trainer.default_local_dir="${ckpts_home}" \
     trainer.resume_mode=${RESUME_MODE} \
 

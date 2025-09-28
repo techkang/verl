@@ -271,6 +271,8 @@ class FSDPEngine(BaseEngine):
 
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+            module.vision_backbone.set_num_images_in_input(2)
         return module
 
     def _build_lora_module(self, module):
@@ -943,27 +945,32 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
             model_inputs.pop("position_ids")
+            model_inputs["pixel_values"] = micro_batch["pixel_values"]
+            model_inputs["labels"] = micro_batch["labels"]
 
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
             )  # prevent model thinks we are generating
 
-            model_output = self.prepare_model_outputs(
-                output=raw_output, output_args=output_args, micro_batch=micro_batch
-            )
-
-            if loss_function is not None:
-                loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+            if "loss" not in raw_output:
+                model_output = self.prepare_model_outputs(
+                    output=raw_output, output_args=output_args, micro_batch=micro_batch
                 )
+
+                if loss_function is not None:
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+                    )
+                else:
+                    assert forward_only, "forward_only must be True when loss_function is None"
+                    loss = torch.tensor(1.0, device=device_name)
+                    metrics = {}
             else:
-                assert forward_only, "forward_only must be True when loss_function is None"
-                loss = torch.tensor(1.0, device=device_name)
-                metrics = {}
+                loss = raw_output["loss"]
+                metrics = {"loss": loss.detach().cpu().item()}
 
             output = {
-                "model_output": model_output,
                 "loss": loss,
                 "metrics": metrics,
             }

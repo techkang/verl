@@ -398,15 +398,19 @@ class MultiTurnSFTDataset(Dataset):
         attention_mask = [1] * len(input_ids)
         loss_mask = [0] * len(input_ids)
         loss_mask[-(len(all_actions_str) + 1) :] = [1] * (len(all_actions_str) + 1)
+        labels = input_ids[:]
+        labels[: len(labels) - (len(all_actions_str) + 1)] = [-100] * (len(labels) - (len(all_actions_str) + 1))
 
         pad_ids = [self.processor.tokenizer.pad_token_type_id] * (self.max_text_len - len(input_ids))
         attention_pad_mask = [0] * len(pad_ids)
+        label_pad_id = [-100] * len(pad_ids)
         position_ids = list(range(0, len(input_ids)))
 
         input_ids += pad_ids
         attention_mask += attention_pad_mask
         loss_mask += attention_pad_mask
         position_ids += attention_pad_mask
+        labels += label_pad_id
 
         result = {
             "input_ids": torch.tensor(input_ids),
@@ -416,6 +420,7 @@ class MultiTurnSFTDataset(Dataset):
             "loss_mask": torch.tensor(loss_mask),
             "response_mask": torch.tensor(loss_mask),
             "pixel_values": inputs["pixel_values"][0],
+            "labels": torch.tensor(labels),
         }
 
         return result
