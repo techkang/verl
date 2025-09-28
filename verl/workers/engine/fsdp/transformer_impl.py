@@ -512,6 +512,9 @@ class FSDPEngine(BaseEngine):
             grad_norm (float): Norm of gradients before clipping.
         """
         assert self.optimizer_config.clip_grad is not None
+        import ipdb
+
+        ipdb.set_trace()
 
         if isinstance(self.module, FSDP):
             grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
@@ -912,6 +915,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            model_inputs.pop("position_ids")
+
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,

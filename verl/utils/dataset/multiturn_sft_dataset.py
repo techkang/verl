@@ -16,18 +16,21 @@
 Multi-turn SFT dataset that supports training on conversation data with multiple turns
 """
 
+import json
+import sys
+
 import numpy as np
-import pandas as pd
 import torch
 from omegaconf import ListConfig
-from qwen_vl_utils import process_vision_info
 from torch.utils.data import Dataset
 from transformers import AutoProcessor
 
-from verl.utils.dataset.vision_utils import process_image
-from verl.utils.fs import copy_local_path_from_hdfs
-from verl.utils.model import compute_position_id_with_mask
-from verl.utils.torch_functional import pad_sequence_to_length, postprocess_data
+sys.path.insert(0, "/file_system/kangsheng/openvla-oft")
+from datasets import load_dataset
+from experiments.robot.libero.run_libero_eval import GenerateConfig
+from experiments.robot.openvla_utils import normalize_proprio, prepare_images_for_vla
+from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.constants import NUM_ACTIONS_CHUNK
 
 
 def convert_nested_value_to_list_recursive_if_not_none(data_item):
@@ -43,6 +46,57 @@ def convert_nested_value_to_list_recursive_if_not_none(data_item):
         return data_item
 
 
+class PurePromptBuilder:
+    def __init__(self, model_family: str, system_prompt: str | None = None) -> None:
+        self.model_family = model_family
+        self.system_prompt = system_prompt
+        # TODO (siddk) =>> Can't always assume LlamaTokenizer --> FIX ME!
+        self.bos, self.eos = "<s>", "</s>"
+
+        # Get role-specific "wrap" functions
+        self.wrap_human = lambda msg: f"In: {msg}\nOut: "
+        self.wrap_gpt = lambda msg: f"{msg if msg != '' else ' '}{self.eos}"
+
+        # === `self.prompt` gets built up over multiple turns ===
+        self.prompt, self.turn_count = "", 0
+
+    def clear(self):
+        self.prompt, self.turn_count = "", 0
+
+    def add_turn(self, role: str, message: str) -> str:
+        assert (role == "human") if (self.turn_count % 2 == 0) else (role == "gpt")
+        message = message.replace("<image>", "").strip()
+
+        if (self.turn_count % 2) == 0:
+            human_message = self.wrap_human(message)
+            wrapped_message = human_message
+        else:
+            gpt_message = self.wrap_gpt(message)
+            wrapped_message = gpt_message
+
+        # Update Prompt
+        self.prompt += wrapped_message
+
+        # Bump Turn Counter
+        self.turn_count += 1
+
+        # Return "wrapped_message" (effective string added to context)
+        return wrapped_message
+
+    def get_potential_prompt(self, message: str) -> None:
+        # Assumes that it's always the user's (human's) turn!
+        prompt_copy = str(self.prompt)
+
+        human_message = self.wrap_human(message)
+        prompt_copy += human_message
+
+        return prompt_copy.removeprefix(self.bos).rstrip()
+
+    def get_prompt(self) -> str:
+        # Remove prefix <bos> (if exists) because it gets auto-inserted by tokenizer!
+        return self.prompt.removeprefix(self.bos).rstrip()
+
+
 class MultiTurnSFTDataset(Dataset):
     """
     Dataset for multi-turn conversations where each assistant response should be trained
@@ -50,6 +104,21 @@ class MultiTurnSFTDataset(Dataset):
 
     def __init__(self, parquet_files: str | list[str], processor, config=None):
         # Set defaults and extract parameters from config if provided
+
+        self.gen_cfg = GenerateConfig(
+            pretrained_checkpoint="",  # 使用 HF Hub 上的基础模型进行测试
+            use_l1_regression=True,
+            use_diffusion=False,
+            use_film=False,
+            num_images_in_input=2,
+            use_proprio=True,
+            load_in_8bit=False,
+            load_in_4bit=False,
+            center_crop=True,
+            num_open_loop_steps=NUM_ACTIONS_CHUNK,
+            unnorm_key="libero_10_no_noops",
+        )
+
         config = config or {}
         self.pad_mode = config.get("pad_mode", "right")
         assert self.pad_mode in ["right", "left_right"], (
@@ -76,265 +145,284 @@ class MultiTurnSFTDataset(Dataset):
         self.parquet_files = parquet_files
         self.processor: AutoProcessor = processor
 
-        self._download()
-        self._read_files_and_process()
+        self.proprio_norm_stat = {
+            "mean": [
+                -0.04190658777952194,
+                0.03539430722594261,
+                0.8257141709327698,
+                2.908308267593384,
+                -0.5562185049057007,
+                -0.16649018228054047,
+                0.028316624462604523,
+                -0.028561657294631004,
+            ],
+            "std": [
+                0.10743364691734314,
+                0.14424669742584229,
+                0.2572328448295593,
+                0.3441362977027893,
+                1.234421730041504,
+                0.3579835891723633,
+                0.013308707624673843,
+                0.013174631632864475,
+            ],
+            "max": [
+                0.21031762659549713,
+                0.39128610491752625,
+                1.3332009315490723,
+                3.6714255809783936,
+                3.560650587081909,
+                1.386339545249939,
+                0.04160946607589722,
+                0.0013633022317662835,
+            ],
+            "min": [
+                -0.4828203022480011,
+                -0.3255046010017395,
+                0.445506751537323,
+                1.1321442127227783,
+                -3.641430377960205,
+                -1.842738389968872,
+                -0.0010040868073701859,
+                -0.04111652821302414,
+            ],
+            "q01": [
+                -0.3899900782108307,
+                -0.2838300323486328,
+                0.44795057058334353,
+                1.8810229921340942,
+                -2.886677579879761,
+                -1.1599004411697387,
+                0.002066459748893976,
+                -0.04001387819647789,
+            ],
+            "q99": [
+                0.1530261474847791,
+                0.32915401458740223,
+                1.2546923208236693,
+                3.303542451858519,
+                2.7496529006957933,
+                0.6893712210655194,
+                0.040048558115959164,
+                -0.0017598449345678235,
+            ],
+        }
+        self.vla_norm_stats = {
+            "libero_10_no_noops": {
+                "action": {
+                    "mean": [
+                        0.01820324920117855,
+                        0.05858374014496803,
+                        -0.05592384561896324,
+                        0.004626928828656673,
+                        0.00289608770981431,
+                        -0.007673131301999092,
+                        0.5457824468612671,
+                    ],
+                    "std": [
+                        0.2825464606285095,
+                        0.35904666781425476,
+                        0.3673802614212036,
+                        0.03770702704787254,
+                        0.05429719388484955,
+                        0.08725254982709885,
+                        0.49815231561660767,
+                    ],
+                    "max": [0.9375, 0.9375, 0.9375, 0.30000001192092896, 0.29357144236564636, 0.375, 1.0],
+                    "min": [
+                        -0.9375,
+                        -0.9375,
+                        -0.9375,
+                        -0.23642857372760773,
+                        -0.3053571283817291,
+                        -0.3675000071525574,
+                        0.0,
+                    ],
+                    "q01": [
+                        -0.6348214149475098,
+                        -0.7741071581840515,
+                        -0.7633928656578064,
+                        -0.09749999642372131,
+                        -0.14819999992847435,
+                        -0.2742857038974762,
+                        0.0,
+                    ],
+                    "q99": [
+                        0.7714285850524902,
+                        0.8464285731315613,
+                        0.9375,
+                        0.13928571343421936,
+                        0.15964286029338837,
+                        0.3246428668498993,
+                        1.0,
+                    ],
+                    "mask": [True, True, True, True, True, True, False],
+                },
+                "proprio": {
+                    "mean": [
+                        -0.04190658777952194,
+                        0.03539430722594261,
+                        0.8257141709327698,
+                        2.908308267593384,
+                        -0.5562185049057007,
+                        -0.16649018228054047,
+                        0.028316624462604523,
+                        -0.028561657294631004,
+                    ],
+                    "std": [
+                        0.10743364691734314,
+                        0.14424669742584229,
+                        0.2572328448295593,
+                        0.3441362977027893,
+                        1.234421730041504,
+                        0.3579835891723633,
+                        0.013308707624673843,
+                        0.013174631632864475,
+                    ],
+                    "max": [
+                        0.21031762659549713,
+                        0.39128610491752625,
+                        1.3332009315490723,
+                        3.6714255809783936,
+                        3.560650587081909,
+                        1.386339545249939,
+                        0.04160946607589722,
+                        0.0013633022317662835,
+                    ],
+                    "min": [
+                        -0.4828203022480011,
+                        -0.3255046010017395,
+                        0.445506751537323,
+                        1.1321442127227783,
+                        -3.641430377960205,
+                        -1.842738389968872,
+                        -0.0010040868073701859,
+                        -0.04111652821302414,
+                    ],
+                    "q01": [
+                        -0.3899900782108307,
+                        -0.2838300323486328,
+                        0.44795057058334353,
+                        1.8810229921340942,
+                        -2.886677579879761,
+                        -1.1599004411697387,
+                        0.002066459748893976,
+                        -0.04001387819647789,
+                    ],
+                    "q99": [
+                        0.1530261474847791,
+                        0.32915401458740223,
+                        1.2546923208236693,
+                        3.303542451858519,
+                        2.7496529006957933,
+                        0.6893712210655194,
+                        0.040048558115959164,
+                        -0.0017598449345678235,
+                    ],
+                },
+                "num_transitions": 101469,
+                "num_trajectories": 379,
+            }
+        }
+        assert len(parquet_files) == 1
+        parquet_files = parquet_files[0]
+        data = load_dataset(parquet_files)
+        with open(f"{parquet_files}/meta/tasks.jsonl") as f:
+            tasks = f.read().strip().split("\n")
+        self.tasks = [json.loads(i) for i in tasks]
 
-    def _download(self):
-        for i, parquet_file in enumerate(self.parquet_files):
-            self.parquet_files[i] = copy_local_path_from_hdfs(parquet_file, verbose=True)
-
-    def _read_files_and_process(self):
-        dataframes = []
-        for parquet_file in self.parquet_files:
-            dataframe = pd.read_parquet(parquet_file)
-            dataframes.append(dataframe)
-        self.dataframe = pd.concat(dataframes)
-
-        # Extract messages list from dataframe
-        self.messages = (
-            self.dataframe[self.messages_key].apply(convert_nested_value_to_list_recursive_if_not_none).tolist()
-        )
-
-        if self.images_key in self.dataframe.columns:
-            self.images = (
-                self.dataframe[self.images_key].apply(convert_nested_value_to_list_recursive_if_not_none).to_list()
-            )
-        else:
-            self.images = None
-
-        # Extract tools list from dataframe
-        if self.tools_key in self.dataframe.columns:
-            self.tools = (
-                self.dataframe[self.tools_key].apply(convert_nested_value_to_list_recursive_if_not_none).tolist()
-            )
-        else:
-            self.tools = None
-        # Extract enable_thinking list from dataframe
-        if self.enable_thinking_key in self.dataframe.columns:
-            self.enable_thinking = self.dataframe[self.enable_thinking_key].tolist()
-        else:
-            self.enable_thinking = None
+        self.all_obs = data["train"]
+        self.action_tokenizer = ActionTokenizer(processor.tokenizer)
+        self.prompt_builder = PurePromptBuilder("openvla")
+        self.max_text_len = 128
 
     def __len__(self):
-        return len(self.messages)
-
-    def _get_pad_id(self):
-        if hasattr(self.processor, "tokenizer"):
-            tokenizer = self.processor.tokenizer
-        else:
-            tokenizer = self.processor
-        if getattr(tokenizer, "pad_token_id", None) is not None:
-            return tokenizer.pad_token_id
-        # for qwen2.5 vl
-        if getattr(tokenizer, "pad_token_type_id", None) is not None:
-            return tokenizer.pad_token_type_id
-        return 0
+        return len(self.all_obs)
 
     def __getitem__(self, item):
-        messages = self.messages[item]
-        tools = self.tools[item] if self.tools is not None else None
-        enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
-        if self.images:
-            images = [process_image(img) for img in self.images[item]]
-            for convs in messages:
-                for conv in convs["content"]:
-                    if conv["type"] == "image":
-                        conv["image"] = images[int(conv["image"])]
-        else:
-            images = None
+        obs = self.all_obs[item]
+        task_index = int(obs["task_index"])
+        task_label = self.tasks[task_index]["task"]
 
-        full_text = self.processor.apply_chat_template(
-            messages,
-            tools=tools,
-            tokenize=False,
-            return_tensors="pt",
-            add_generation_prompt=False,
-            enable_thinking=enable_thinking,
-        )
-        if getattr(self.processor, "image_token", None):
-            images, videos = process_vision_info(messages)
-            tokens = self.processor(text=[full_text], images=images, videos=videos, padding=False)
-        else:
-            tokens = self.processor(text=[full_text], padding=False)
-        input_ids = tokens.input_ids[0]
-        attention_mask = tokens.attention_mask[0]
-        pixel_values = getattr(tokens, "pixel_values", None)
-        image_grid_thw = getattr(tokens, "image_grid_thw", None)
+        all_images = [np.array(obs["image"]), np.array(obs["wrist_image"])]
 
-        loss_mask = [0] * len(input_ids)
-        empty_with_gen_prompt = self.processor.apply_chat_template(
-            [{"role": "user", "content": "123"}], add_generation_prompt=True, tokenize=False
-        )
-        empty_without_gen_prompt = self.processor.apply_chat_template(
-            [{"role": "user", "content": "123"}], add_generation_prompt=False, tokenize=False
-        )
-        gen_prompt = empty_with_gen_prompt[len(empty_without_gen_prompt) :]
-        if hasattr(self.processor, "tokenizer"):
-            gen_tokens = self.processor.tokenizer.encode(gen_prompt)
-            end_tokens = [self.processor.tokenizer.encode(empty_without_gen_prompt.strip())[-1]]
-        else:
-            gen_tokens = self.processor.encode(gen_prompt)
-            end_tokens = [self.processor.encode(empty_without_gen_prompt.strip())[-1]]
-        start_indexes = []
-        end_indexes = []
-        i = 0
-        while i < len(input_ids):
-            if input_ids[i : i + len(gen_tokens)] == gen_tokens:
-                start_indexes.append(i + len(gen_tokens))
-                i += len(gen_tokens)
-                while i < len(input_ids):
-                    if input_ids[i : i + len(end_tokens)] == end_tokens:
-                        end_indexes.append(i + len(end_tokens))
-                        break
-                    i += 1
-            i += 1
-        assert len(start_indexes) == len(end_indexes)
-        for start, end in zip(start_indexes, end_indexes, strict=False):
-            assert end > start
-            loss_mask[start:end] = [1] * (end - start)
+        # Process images
+        all_images = prepare_images_for_vla(all_images, self.gen_cfg)
 
-        input_ids, loss_mask, attention_mask = (
-            torch.tensor(input_ids),
-            torch.tensor(loss_mask),
-            torch.tensor(attention_mask),
-        )
+        # Extract primary image and additional images
+        primary_image = all_images.pop(0)
 
-        # encode prompt
-        if messages[0]["role"] == "system":
-            assert messages[1]["role"] == "user"
-            assert messages[2]["role"] == "assistant"
-            prompt_message_length = 2
-        elif messages[0]["role"] == "user":
-            assert messages[1]["role"] == "assistant"
-            prompt_message_length = 1
-        else:
-            raise ValueError(f"Unknown role: {messages[0]['role']}")
+        # Build VLA prompt
+        prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
-        sequence_length = input_ids.shape[0]
-        # Handle sequence length
-        if self.pad_mode == "right":
-            if sequence_length < self.max_length:
-                # Pad sequences
-                pad_token_id = self._get_pad_id()
-                padded_input_ids = torch.full((self.max_length - sequence_length,), pad_token_id, dtype=input_ids.dtype)
-                padded_attention_mask = torch.zeros((self.max_length - sequence_length,), dtype=attention_mask.dtype)
-                padded_loss_mask = torch.zeros((self.max_length - sequence_length,), dtype=loss_mask.dtype)
+        # Process primary image
+        inputs = self.processor(prompt, primary_image).to(dtype=torch.bfloat16)
 
-                input_ids = torch.cat((input_ids, padded_input_ids))
-                attention_mask = torch.cat((attention_mask, padded_attention_mask))
-                loss_mask = torch.cat((loss_mask, padded_loss_mask))
-            elif sequence_length > self.max_length:
-                if self.truncation == "left":
-                    input_ids = input_ids[-self.max_length :]
-                    attention_mask = attention_mask[-self.max_length :]
-                    loss_mask = loss_mask[-self.max_length :]
-                elif self.truncation == "right":
-                    input_ids = input_ids[: self.max_length]
-                    attention_mask = attention_mask[: self.max_length]
-                    loss_mask = loss_mask[: self.max_length]
-                elif self.truncation == "error":
-                    raise ValueError(f"{sequence_length=} is larger than {self.max_length=}")
-                else:
-                    raise ValueError(f"Unknown truncation method {self.truncation}")
+        # Process additional wrist images if any
+        if all_images:
+            all_wrist_inputs = [
+                self.processor(prompt, image_wrist).to(dtype=torch.bfloat16) for image_wrist in all_images
+            ]
+            # Concatenate all images
+            primary_pixel_values = inputs["pixel_values"]
+            all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]
+            inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
 
-            if (
-                self.processor is not None
-                and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
-            ):
-                from verl.models.transformers.qwen2_vl import get_rope_index
+        # Process proprioception data if used
+        proprio = None
+        if self.gen_cfg.use_proprio:
+            proprio = obs["state"]
+            proprio_norm_stats = self.vla_norm_stats[self.gen_cfg.unnorm_key]["proprio"]
+            obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
+            proprio = obs["state"]
 
-                vision_position_ids = get_rope_index(
-                    self.processor,
-                    input_ids=input_ids,
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=None,
-                    second_per_grid_ts=None,
-                    attention_mask=attention_mask,
-                )  # (3, seq_length)
-                valid_mask = attention_mask.bool()
-                text_position_ids = torch.ones((1, len(input_ids)), dtype=torch.long)
-                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
-                position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0)  # (1, 4, seq_length)
+        current_action = obs["actions"]
+        next_6_actions = []
+        for i in range(item + 1, item + 7):
+            if i >= len(self) or self.all_obs[i]["episode_index"] != obs["episode_index"]:
+                next_6_actions.extend(current_action)
             else:
-                # Create position IDs
-                position_ids = torch.arange(len(input_ids), dtype=torch.long)
-                # Zero out position IDs for padding
-                position_ids = position_ids * attention_mask
+                next_6_actions.extend(self.all_obs[i]["actions"])
+        all_actions = current_action + next_6_actions
+        all_actions_str = self.action_tokenizer(all_actions)
 
-            result = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "responses": input_ids,
-                "loss_mask": loss_mask,
-                "response_mask": loss_mask,
-            }
-        elif self.pad_mode == "left_right":
-            assert self.truncation == "error", "Only support error truncation for left_right pad mode"
-            prompt_str = self.processor.apply_chat_template(
-                messages[:prompt_message_length],
-                tools=tools,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-                **self.apply_chat_template_kwargs,
-            )
-            prompt_ids = self.processor.encode(prompt_str, add_special_tokens=False)
-            prompt_length = len(prompt_ids)
-            prompt_ids = input_ids[:prompt_length].unsqueeze(0)
-            prompt_attention_mask = attention_mask[:prompt_length].unsqueeze(0)
-            prompt_loss_mask = loss_mask[:prompt_length].unsqueeze(0)
-            response_ids = input_ids[prompt_length:].unsqueeze(0)
-            response_attention_mask = attention_mask[prompt_length:].unsqueeze(0)
-            response_loss_mask = loss_mask[prompt_length:].unsqueeze(0)
+        conversation = [
+            {"from": "human", "value": f"What action should the robot take to {task_label}?"},
+            {"from": "gpt", "value": all_actions_str},
+        ]
+        self.prompt_builder.clear()
+        for turn in conversation:
+            self.prompt_builder.add_turn(turn["from"], turn["value"])
 
-            assert prompt_loss_mask.sum().item() == 0
+        input_ids = self.processor.tokenizer(self.prompt_builder.get_prompt(), add_special_tokens=True).input_ids
+        attention_mask = [1] * len(input_ids)
+        loss_mask = [0] * len(input_ids)
+        loss_mask[-(len(all_actions_str) + 1) :] = [1] * (len(all_actions_str) + 1)
 
-            prompt_ids, prompt_attention_mask = postprocess_data(
-                input_ids=prompt_ids,
-                attention_mask=prompt_attention_mask,
-                max_length=self.max_prompt_length,
-                pad_token_id=self.tokenizer.pad_token_id,
-                left_pad=True,
-                truncation=self.truncation,
-            )
+        pad_ids = [self.processor.tokenizer.pad_token_type_id] * (self.max_text_len - len(input_ids))
+        attention_pad_mask = [0] * len(pad_ids)
+        position_ids = list(range(0, len(input_ids)))
 
-            response_ids, response_attention_mask = postprocess_data(
-                input_ids=response_ids,
-                attention_mask=response_attention_mask,
-                max_length=self.max_response_length,
-                pad_token_id=self.tokenizer.pad_token_id,
-                left_pad=False,
-                truncation=self.truncation,
-            )
-            response_loss_mask = pad_sequence_to_length(
-                response_loss_mask, max_seq_len=self.max_response_length, pad_token_id=0, left_pad=False
-            )
+        input_ids += pad_ids
+        attention_mask += attention_pad_mask
+        loss_mask += attention_pad_mask
+        position_ids += attention_pad_mask
 
-            prompt_ids = prompt_ids[0]
-            prompt_attention_mask = prompt_attention_mask[0]
-            response_ids = response_ids[0]
-            response_attention_mask = response_attention_mask[0]
-            response_loss_mask = response_loss_mask[0]
+        result = {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "position_ids": torch.tensor(position_ids),
+            "responses": torch.tensor(input_ids),
+            "loss_mask": torch.tensor(loss_mask),
+            "response_mask": torch.tensor(loss_mask),
+            "pixel_values": inputs["pixel_values"][0],
+        }
 
-            assert response_attention_mask[0].item() == 1
-            assert response_loss_mask[0].item() == 1
-
-            input_ids = torch.cat((prompt_ids, response_ids), dim=0)
-            attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=0)
-            position_ids = compute_position_id_with_mask(attention_mask)
-
-            result = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "responses": response_ids,
-                "response_mask": response_loss_mask,
-            }
-        else:
-            raise NotImplementedError("pad_mode only support right or left-right mode!")
-        if pixel_values is not None:
-            result["multi_modal_inputs"] = {}
-            result["multi_modal_inputs"]["pixel_values"] = pixel_values
-            result["multi_modal_inputs"]["image_grid_thw"] = image_grid_thw
         return result
+
+
+if __name__ == "__main__":
+    dataset = MultiTurnSFTDataset(
+        ["libero_dataset"], "/file_system/common-models/moojink/openvla-7b-oft-finetuned-libero-10/"
+    )
+    print(dataset[0])

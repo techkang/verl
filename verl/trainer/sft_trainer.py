@@ -20,6 +20,7 @@ os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import logging
+import sys
 
 import hydra
 import torch
@@ -39,6 +40,8 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.logger import log_with_rank
 from verl.utils.tracking import Tracking
 
+sys.path.insert(0, "/file_system/kangsheng/openvla-oft")
+
 if is_cuda_available:
     pass
 elif is_npu_available:
@@ -51,7 +54,8 @@ logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 def multi_modal_collect(data):
     multi_modal_data = [i.pop("multi_modal_inputs", None) for i in data]
     others = default_collate(data)
-    others["multi_modal_inputs"] = multi_modal_data
+    if multi_modal_data[0] is not None:
+        others["multi_modal_inputs"] = multi_modal_data
     return others
 
 
@@ -187,7 +191,7 @@ class SFTTrainer:
             dataset=self.train_dataset,
             batch_size=self.train_batch_size_per_dp,
             sampler=self.train_sampler,
-            num_workers=8,
+            num_workers=0,
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
@@ -201,7 +205,7 @@ class SFTTrainer:
             dataset=self.val_dataset,
             batch_size=self.train_batch_size_per_dp,
             sampler=self.val_sampler,
-            num_workers=8,
+            num_workers=0,
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
@@ -356,9 +360,9 @@ class SFTTrainer:
 
 
 def run_sft(config):
-    from verl.utils.distributed import initialize_global_process_group
+    # from verl.utils.distributed import initialize_global_process_group
 
-    initialize_global_process_group()
+    # initialize_global_process_group()
     trainer = SFTTrainer(config=config)
     trainer.fit()
     destroy_global_process_group()
