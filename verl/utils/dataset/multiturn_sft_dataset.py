@@ -397,7 +397,9 @@ class MultiTurnSFTDataset(Dataset):
             same_episode = int(candidate.get("episode_index", episode_index)) == episode_index
             same_task = int(candidate.get("task_index", task_index)) == task_index
             if same_episode and same_task:
-                actions.append(candidate["actions"])
+                actions_ = candidate["actions"]
+                actions_[-1] *= -1
+                actions.append(actions_)
                 valid_steps += 1
             else:
                 actions.append(zero_action)
